@@ -9,7 +9,7 @@ Centralized repository for development scripts, shell configuration, and tooling
 
 ## Installation
 
-Run the provided install script to setup symlinks and update your shell configuration:
+Run the provided install script to setup symlinks, merge existing local scripts/sources into the repository, and update your shell configuration:
 
 ```bash
 cd /mnt/d/git/dev-tools
@@ -21,3 +21,4 @@ chmod +x install.sh
 
 - **Automated PATH**: Scripts in `~/scripts` are added to your shell PATH.
 - **Auto-Sourcing**: Any `.zsh` file added to `~/sources/` is automatically sourced on shell startup.
+- **Backup & Merge**: Existing `~/scripts` and `~/sources` directories are backed up and merged into the repository during installation.
