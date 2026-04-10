@@ -1,0 +1,294 @@
+#!/usr/bin/env bash
+
+# Default session name
+SESSION=${GEMINI_SESSION:-"gemini-work"}
+YOLO=${GEMINI_YOLO:-false}
+
+# Usage instructions
+usage() {
+    cat <<EOF
+Usage: gemini-mux [command] [args...]
+
+Commands:
+  start [file] [--yolo]  Start a new session from a file (default: WORKSTREAMS.md)
+  add <name> <tree> <task> [--yolo]  Add a single workstream to current session
+  attach                 Attach to the gemini-work session
+  list                   List current windows in the session
+  status                 Show status of all workstreams
+  combine <branch>       Merge all worktrees into a new branch and start Gemini
+  stop                   Kill the session
+  watch                  Start a background watchdog (notifies on input/done/error)
+
+Environment:
+  GEMINI_SESSION   Override default session name (default: gemini-work)
+  GEMINI_YOLO      Set to "true" to enable --yolo for all workstreams
+EOF
+}
+
+# Helper to get status of a tmux window
+get_status() {
+    local idx=$1
+    local name=$2
+    # Capture more lines to be sure we see the stopped message
+    local content=$(tmux capture-pane -pt "$SESSION:$idx" -S -10)
+    
+    if echo "$content" | grep -Fq "Workstream '$name' stopped."; then
+        echo "STOPPED"
+    elif echo "$content" | grep -Ei "Confirm\?|\[y/N\]|\(y/n\)" >/dev/null; then
+        echo "INPUT_NEEDED"
+    elif echo "$content" | grep -Ei "Error:|Exception:|CRASHED|failed" >/dev/null; then
+        echo "ERROR"
+    elif echo "$content" | grep -Ei "Success|Done|Task complete|Validation complete" >/dev/null; then
+        echo "READY"
+    else
+        echo "RUNNING"
+    fi
+}
+
+# Add a single workstream to the session
+add_workstream() {
+    local name=$1
+    local tree=$2
+    local task=$3
+    local use_yolo=$4
+    
+    if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+        echo "Creating new session: $SESSION"
+        tmux new-session -d -s "$SESSION" -n "main"
+        # Enable activity monitoring globally for this session
+        tmux set-option -t "$SESSION" monitor-activity on
+        tmux set-option -t "$SESSION" visual-activity off
+    fi
+
+    local yolo_flag=""
+    if [[ "$use_yolo" == "true" ]] || [[ "$YOLO" == "true" ]]; then
+        yolo_flag="--yolo"
+    fi
+
+    # Check if a window with this name already exists
+    if tmux list-windows -t "$SESSION" -F "#W" | grep -qx "$name"; then
+        echo "Workstream '$name' already exists, skipping window creation."
+        return
+    fi
+
+    echo "Adding workstream '$name' with worktree '$tree' ${yolo_flag}..."
+    win_id=$(tmux new-window -d -t "$SESSION" -n "$name" -P -F "#{window_id}")
+    # Tag window with worktree info for the combine command
+    tmux set-option -w -t "$win_id" @worktree "$tree"
+    
+    # Persistent loop with Resume and Restart options
+    local cmd="while true; do \
+        if [ -d \".gemini/worktrees/$tree\" ]; then \
+            echo \"Worktree '$tree' exists, resuming...\"; \
+            (cd \".gemini/worktrees/$tree\" && gemini --resume latest $yolo_flag); \
+        else \
+            gemini $yolo_flag --worktree \"$tree\" \"$task\"; \
+        fi; \
+        while true; do \
+            echo \"\nWorkstream '$name' stopped. [ENTER] to Resume, [r] to Restart Original, [q] to Quit\"; \
+            read -n 1 opt; echo; \
+            if [ \"\$opt\" = \"r\" ]; then \
+                break; \
+            elif [ \"\$opt\" = \"q\" ]; then \
+                exit 0; \
+            else \
+                echo \"Resuming workstream '$name' in .gemini/worktrees/$tree...\"; \
+                (cd \".gemini/worktrees/$tree\" && gemini --resume latest $yolo_flag); \
+            fi; \
+        done; \
+    done"
+    
+    tmux send-keys -t "$win_id" "$cmd" C-m
+}
+
+# Watchdog function to be run in background
+watchdog() {
+    echo "Starting gemini-mux watchdog for session '$SESSION'..."
+    local last_notified=""
+    local all_done_notified="false"
+
+    while true; do
+        if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+            echo "Session '$SESSION' not found. Exiting watchdog."
+            exit 0
+        fi
+
+        local windows=$(tmux list-windows -t "$SESSION" -F "#I:#W")
+        local all_stopped="true"
+        local total_workstreams=0
+
+        for win_info in $windows; do
+            local idx=${win_info%%:*}
+            local name=${win_info#*:}
+            
+            # Skip non-workstream windows
+            [[ "$name" == "main" || "$name" == "combine" ]] && continue
+            
+            ((total_workstreams++))
+            local status=$(get_status "$idx" "$name")
+
+            if [[ "$status" != "STOPPED" ]]; then
+                all_stopped="false"
+            fi
+
+            if [[ -n "$status" && "$status" != "RUNNING" ]]; then
+                local notify_key="$name:$status"
+                if [[ "$last_notified" != *"$notify_key"* ]]; then
+                    notify-send "Gemini Mux: $name" "Status: $status" -u normal
+                    last_notified="$last_notified $notify_key"
+                fi
+            fi
+        done
+
+        # Notify if all workstreams are STOPPED
+        if [[ "$total_workstreams" -gt 0 && "$all_stopped" == "true" ]]; then
+            if [[ "$all_done_notified" == "false" ]]; then
+                notify-send "Gemini Mux" "All workstreams are DONE!" -u critical
+                all_done_notified="true"
+            fi
+        else
+            all_done_notified="false"
+        fi
+
+        sleep 5
+        [[ ${#last_notified} -gt 500 ]] && last_notified=""
+    done
+}
+
+case "$1" in
+    start)
+        FILE="WORKSTREAMS.md"
+        USE_YOLO="false"
+        
+        # Simple arg parsing for start
+        shift
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                --yolo) USE_YOLO="true" ;;
+                *) FILE=$1 ;;
+            esac
+            shift
+        done
+
+        if [[ ! -f "$FILE" ]]; then
+            echo "Error: Configuration file '$FILE' not found."
+            exit 1
+        fi
+        
+        # Ensure session exists first
+        if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+            echo "Creating new session: $SESSION"
+            tmux new-session -d -s "$SESSION" -n "main"
+            tmux set-option -t "$SESSION" monitor-activity on
+            tmux set-option -t "$SESSION" visual-activity off
+        fi
+
+        # Add status window running watch
+        tmux new-window -d -t "$SESSION" -n "status" "watch -n 5 gemini-mux status"
+
+        # Read file lines (format: name:worktree:task)
+        while IFS=':' read -r name tree task; do
+            [[ "$name" =~ ^#.* ]] || [[ -z "$name" ]] && continue
+            add_workstream "$name" "$tree" "$task" "$USE_YOLO"
+        done < "$FILE"
+        
+        # Start watchdog in background
+        nohup "$0" watch > /tmp/gemini-mux-watch.log 2>&1 &
+        
+        tmux select-window -t "$SESSION:status"
+        tmux attach-session -t "$SESSION"
+        ;;
+    watch)
+        watchdog
+        ;;
+    add)
+        if [[ $# -lt 4 ]]; then
+            echo "Usage: gemini-mux add <name> <tree> <task> [--yolo]"
+            exit 1
+        fi
+        USE_YOLO="false"
+        [[ "$5" == "--yolo" ]] && USE_YOLO="true"
+        add_workstream "$2" "$3" "$4" "$USE_YOLO"
+        ;;
+    status)
+        if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+            echo "Session '$SESSION' not found."
+            exit 1
+        fi
+        echo "Workstream Status for session '$SESSION':"
+        printf "%-20s %-15s\n" "WINDOW" "STATUS"
+        printf "%-20s %-15s\n" "------" "------"
+        
+        windows=$(tmux list-windows -t "$SESSION" -F "#I:#W")
+        for win_info in $windows; do
+            idx=${win_info%%:*}
+            name=${win_info#*:}
+            [[ "$name" == "main" || "$name" == "combine" || "$name" == "status" ]] && continue
+            
+            status=$(get_status "$idx" "$name")
+            printf "%-20s %-15s\n" "$name" "$status"
+        done
+        ;;
+    combine)
+        if [[ -z "$2" ]]; then
+            echo "Usage: gemini-mux combine <new_branch>"
+            exit 1
+        fi
+        new_branch=$2
+        echo "Creating new branch '$new_branch' and merging worktrees..."
+        
+        git checkout -b "$new_branch" || { echo "Failed to create branch. Maybe it already exists?"; exit 1; }
+        
+        windows=$(tmux list-windows -t "$SESSION" -F "#I:#W")
+        branches_to_merge=""
+        
+        for win_info in $windows; do
+            idx=${win_info%%:*}
+            name=${win_info#*:}
+            [[ "$name" == "main" || "$name" == "combine" ]] && continue
+            
+            tree=$(tmux show-options -w -v -t "$SESSION:$idx" @worktree 2>/dev/null)
+            if [[ -n "$tree" && -d ".gemini/worktrees/$tree" ]]; then
+                branch=$(git -C ".gemini/worktrees/$tree" branch --show-current)
+                if [[ -n "$branch" ]]; then
+                    branches_to_merge="$branches_to_merge $branch"
+                fi
+            fi
+        done
+        
+        if [[ -z "$branches_to_merge" ]]; then
+            echo "No valid worktrees found in the session to merge."
+            exit 1
+        fi
+        
+        for br in $branches_to_merge; do
+            echo "Merging branch '$br'..."
+            git merge "$br" --no-edit || echo "Merge conflict detected with '$br', continuing..."
+        done
+        
+        echo "Starting Gemini session to resolve conflicts, verify integration, and create tests..."
+        
+        prompt="Review the combined changes from branches:$branches_to_merge. If there are merge conflicts, resolve them carefully to ensure all features work together. Then, run tests, list any integration issues, fix them, and write new tests covering the combined functionality."
+        
+        # Use -d to prevent immediate switch if we are inside tmux, but then we manually select
+        tmux new-window -d -t "$SESSION" -n "combine" "gemini \"$prompt\"; echo 'Combine session finished. Press Enter to close.'; read; exit"
+        tmux select-window -t "$SESSION:combine"
+        
+        # Only attach if we are not already inside a tmux session
+        if [[ -z "$TMUX" ]]; then
+            tmux attach-session -t "$SESSION"
+        fi
+        ;;
+    attach)
+        tmux attach-session -t "$SESSION"
+        ;;
+    list)
+        tmux list-windows -t "$SESSION"
+        ;;
+    stop)
+        tmux kill-session -t "$SESSION"
+        ;;
+    *)
+        usage
+        ;;
+esac
